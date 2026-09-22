@@ -29,6 +29,19 @@ OSRM_TIMEOUT_SECONDS = 3.0
 OSRM_TABLE_TIMEOUT_SECONDS = 10.0
 OSRM_TABLE_MAX_COORDS = 90  # 單次 /table 批次查詢座標數上限，避免超出公用伺服器限制
 
+# Google Routes API
+GOOGLE_ROUTES_URL = (
+    "https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix"
+)
+
+GOOGLE_ROUTES_TIMEOUT_SECONDS = 15.0
+
+# 交通方式 → Google Routes travelMode
+GOOGLE_TRAVEL_MODE_MAP = {
+    "機車": "TWO_WHEELER",
+    "大眾運輸": "TRANSIT",
+}
+
 # 服務項目強度加權係數：依體力耗費強度分級，用於疲勞度模型。
 SERVICE_INTENSITY_WEIGHT = {
     "重度移位": 1.5,  # 重度移位／肢體關節活動
@@ -438,6 +451,185 @@ def get_osrm_travel_time(lat1, lon1, lat2, lon2, travel_min_per_km=3.0):
     _OSRM_TRAVEL_TIME_CACHE[key] = travel_min
     return travel_min
 
+def _get_google_maps_api_key():
+    """
+    優先從 Streamlit secrets 讀取；
+    本機開發時可改由環境變數 GOOGLE_MAPS_API_KEY 提供。
+    """
+    api_key = os.getenv("GOOGLE_MAPS_API_KEY")
+
+    if api_key:
+        return api_key
+
+    try:
+        import streamlit as st
+        return st.secrets["GOOGLE_MAPS_API_KEY"]
+    except Exception:
+        return None
+
+
+_GOOGLE_TRAVEL_TIME_CACHE = {}
+
+
+def _parse_google_duration(duration_str):
+    """
+    Google duration 格式例如 '723s'、'723.5s'
+    → 回傳分鐘。
+    """
+    if not duration_str:
+        return None
+
+    seconds = float(str(duration_str).rstrip("s"))
+    return seconds / 60.0
+
+
+def get_google_travel_time(
+    lat1,
+    lon1,
+    lat2,
+    lon2,
+    transport_mode,
+    travel_min_per_km=3.0,
+):
+    """
+    使用 Google Routes API 計算兩點交通時間。
+
+    transport_mode:
+        機車       -> TWO_WHEELER
+        大眾運輸   -> TRANSIT
+    """
+
+    if lat1 == lat2 and lon1 == lon2:
+        return 0.0
+
+    google_mode = GOOGLE_TRAVEL_MODE_MAP.get(transport_mode)
+
+    if google_mode is None:
+        raise ValueError(
+            f"不支援的常用交通工具：{transport_mode}"
+        )
+
+    key = (
+        _round_coord(lat1),
+        _round_coord(lon1),
+        _round_coord(lat2),
+        _round_coord(lon2),
+        google_mode,
+    )
+
+    if key in _GOOGLE_TRAVEL_TIME_CACHE:
+        return _GOOGLE_TRAVEL_TIME_CACHE[key]
+
+    api_key = _get_google_maps_api_key()
+
+    # 尚未設定 Google API 時，Prototype 暫時沿用 OSRM / 距離概算
+    if not api_key:
+        print(
+            "[Google Routes Warning] 尚未設定 GOOGLE_MAPS_API_KEY，"
+            "暫時使用原 OSRM 交通時間。"
+        )
+
+        return get_osrm_travel_time(
+            lat1,
+            lon1,
+            lat2,
+            lon2,
+            travel_min_per_km,
+        )
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": api_key,
+        "X-Goog-FieldMask": (
+            "originIndex,destinationIndex,"
+            "status,condition,duration,distanceMeters"
+        ),
+    }
+
+    body = {
+        "origins": [
+            {
+                "waypoint": {
+                    "location": {
+                        "latLng": {
+                            "latitude": float(lat1),
+                            "longitude": float(lon1),
+                        }
+                    }
+                }
+            }
+        ],
+        "destinations": [
+            {
+                "waypoint": {
+                    "location": {
+                        "latLng": {
+                            "latitude": float(lat2),
+                            "longitude": float(lon2),
+                        }
+                    }
+                }
+            }
+        ],
+        "travelMode": google_mode,
+        "languageCode": "zh-TW",
+        "regionCode": "TW",
+    }
+
+    # routingPreference 只能用於 DRIVE / TWO_WHEELER，
+    # TRANSIT 不可帶這個欄位。
+    if google_mode == "TWO_WHEELER":
+        body["routingPreference"] = "TRAFFIC_AWARE"
+
+    try:
+        response = requests.post(
+            GOOGLE_ROUTES_URL,
+            headers=headers,
+            json=body,
+            timeout=GOOGLE_ROUTES_TIMEOUT_SECONDS,
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        if not data:
+            raise ValueError("Google Routes API 未回傳路徑")
+
+        element = data[0]
+
+        if element.get("condition") != "ROUTE_EXISTS":
+            raise ValueError(
+                f"Google Routes 無可用路徑："
+                f"{element.get('condition')}"
+            )
+
+        travel_min = _parse_google_duration(
+            element.get("duration")
+        )
+
+        if travel_min is None:
+            raise ValueError("Google Routes 未回傳 duration")
+
+    except Exception as exc:
+
+        print(
+            f"[Google Routes Warning] "
+            f"{transport_mode} 路徑查詢失敗：{exc}"
+        )
+
+        # Google 暫時失效時，不讓整個排班系統掛掉
+        travel_min = get_osrm_travel_time(
+            lat1,
+            lon1,
+            lat2,
+            lon2,
+            travel_min_per_km,
+        )
+
+    _GOOGLE_TRAVEL_TIME_CACHE[key] = travel_min
+
+    return travel_min
 
 def _fetch_osrm_table_chunk(origins, destinations, travel_min_per_km):
     """對一批 origin x destination 座標呼叫 OSRM /table 矩陣 API，一次查詢多組配對的
@@ -505,11 +697,30 @@ def prefetch_osrm_travel_times(origins, destinations, travel_min_per_km=3.0) -> 
         _fetch_osrm_table_chunk(pending_origins, dest_chunk, travel_min_per_km)
 
 
-def calc_travel_minutes(lat1, lon1, lat2, lon2, config: "PipelineConfig") -> float:
-    """兩點間轉場車程（分鐘，不含轉場緩衝）。統一經由 get_osrm_travel_time 查詢，
-    Phase 1 評分與 Phase 2 衝突檢查皆呼叫此函式，確保交通時間模型一致。
+def calc_travel_minutes(
+    lat1,
+    lon1,
+    lat2,
+    lon2,
+    config: "PipelineConfig",
+    transport_mode="機車",
+) -> float:
     """
-    return get_osrm_travel_time(lat1, lon1, lat2, lon2, config.travel_min_per_km)
+    兩點間轉場時間（分鐘，不含轉場緩衝）。
+
+    依居服員「常用交通工具」選擇 Google Routes travel mode：
+    機車 -> TWO_WHEELER
+    大眾運輸 -> TRANSIT
+    """
+
+    return get_google_travel_time(
+        lat1,
+        lon1,
+        lat2,
+        lon2,
+        transport_mode,
+        config.travel_min_per_km,
+    )
 
 
 def get_service_intensity_weight(task) -> float:
@@ -674,9 +885,16 @@ def run_phase1_matching(tasks: pd.DataFrame, df_cg: pd.DataFrame, config: Pipeli
         matched_count_for_task = 0
         reason_counts: dict = {}
 
-        for _, cg in df_cg.iterrows():
-            cg_id = cg["居服員ID"]
-            is_preferred = cg_id == pref_cg
+            for _, cg in df_cg.iterrows():
+                cg_id = cg["居服員ID"]
+                is_preferred = cg_id == pref_cg
+
+            transport_mode = str(
+                cg.get("常用交通工具", "機車")
+            ).strip()
+
+            if transport_mode not in ("機車", "大眾運輸"):
+                transport_mode = "機車"
 
             travel_time_min = calc_travel_minutes(
                 cg["服務起點_緯度(家)"],
@@ -684,6 +902,7 @@ def run_phase1_matching(tasks: pd.DataFrame, df_cg: pd.DataFrame, config: Pipeli
                 client_lat,
                 client_lon,
                 config,
+                transport_mode=transport_mode,
             )
 
             # --- Hard Constraints (硬性過濾，不合格者直接剔除) ---
@@ -844,6 +1063,8 @@ def run_phase1_matching(tasks: pd.DataFrame, df_cg: pd.DataFrame, config: Pipeli
                         int(
                             cert == "精神疾病照顧專長"
                         ),
+
+                    "常用交通工具": transport_mode,
                 }
             )
         if matched_count_for_task == 0:
