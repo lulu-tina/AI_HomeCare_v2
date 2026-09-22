@@ -453,23 +453,34 @@ def get_osrm_travel_time(lat1, lon1, lat2, lon2, travel_min_per_km=3.0):
 
 def _get_google_maps_api_key():
     """
-    優先從 Streamlit secrets 讀取；
-    本機開發時可改由環境變數 GOOGLE_MAPS_API_KEY 提供。
+    優先讀取環境變數，其次讀取 Streamlit secrets。
+    只檢查一次，避免每組交通配對都重複讀取。
     """
+    global _GOOGLE_API_KEY_CACHE
+    global _GOOGLE_API_KEY_CHECKED
+
+    if _GOOGLE_API_KEY_CHECKED:
+        return _GOOGLE_API_KEY_CACHE
+
+    _GOOGLE_API_KEY_CHECKED = True
+
     api_key = os.getenv("GOOGLE_MAPS_API_KEY")
 
-    if api_key:
-        return api_key
+    if not api_key:
+        try:
+            import streamlit as st
+            api_key = st.secrets.get("GOOGLE_MAPS_API_KEY")
+        except Exception:
+            api_key = None
 
-    try:
-        import streamlit as st
-        return st.secrets["GOOGLE_MAPS_API_KEY"]
-    except Exception:
-        return None
+    _GOOGLE_API_KEY_CACHE = api_key
+    return _GOOGLE_API_KEY_CACHE
 
 
 _GOOGLE_TRAVEL_TIME_CACHE = {}
-
+_GOOGLE_API_KEY_CACHE = None
+_GOOGLE_API_KEY_CHECKED = False
+_GOOGLE_API_MISSING_WARNED = False
 
 def _parse_google_duration(duration_str):
     """
@@ -522,20 +533,27 @@ def get_google_travel_time(
 
     api_key = _get_google_maps_api_key()
 
-    # 尚未設定 Google API 時，Prototype 暫時沿用 OSRM / 距離概算
+    # 尚未設定 Google API 時，暫時沿用 OSRM
     if not api_key:
-        print(
-            "[Google Routes Warning] 尚未設定 GOOGLE_MAPS_API_KEY，"
-            "暫時使用原 OSRM 交通時間。"
-        )
+        global _GOOGLE_API_MISSING_WARNED
 
-        return get_osrm_travel_time(
+        if not _GOOGLE_API_MISSING_WARNED:
+            print(
+                "[Google Routes Warning] 尚未設定 GOOGLE_MAPS_API_KEY，"
+                "本次排班統一使用 OSRM 交通時間。"
+            )
+            _GOOGLE_API_MISSING_WARNED = True
+
+        travel_min = get_osrm_travel_time(
             lat1,
             lon1,
             lat2,
             lon2,
             travel_min_per_km,
         )
+
+        _GOOGLE_TRAVEL_TIME_CACHE[key] = travel_min
+        return travel_min
 
     headers = {
         "Content-Type": "application/json",
@@ -545,6 +563,8 @@ def get_google_travel_time(
             "status,condition,duration,distanceMeters"
         ),
     }
+
+
 
     body = {
         "origins": [
@@ -765,10 +785,12 @@ def _check_hard_constraints(
     # `_diagnose_caregiver_change` 診斷「原首選居服員」共用；後者會在回傳訊息前
     # 明確加上 `原首選居服員[ID]` 主語，若訊息本身也帶主語詞，會讓居督誤以為
     # 訊息在描述「獲派居服員」而非「原首選居服員」，見任務一問題分析。
-    req_gender = task["指定居服員性別"]
-    if req_gender == "限女性" and cg["性別"] != "女":
+
+    # Excel 的「指定居服員性別」是：男女不拘，但原本辨識：限男性限女性，所以修改如下
+    req_gender = str(task["指定居服員性別"]).strip()
+    if req_gender in ("女", "限女性") and cg["性別"] != "女":
         return "案家指定女性居服員，性別不符"
-    if req_gender == "限男性" and cg["性別"] != "男":
+    if req_gender in ("男", "限男性") and cg["性別"] != "男":
         return "案家指定男性居服員，性別不符"
 
     if task["需重度移位協助(0/1)"] == 1 and cg["具備重度移位體力(0/1)"] == 0:
@@ -863,17 +885,28 @@ def _check_hard_constraints(
 # ==========================================
 # Phase 1: 適配度過濾與評分機制
 # ==========================================
-def run_phase1_matching(tasks: pd.DataFrame, df_cg: pd.DataFrame, config: PipelineConfig) -> pd.DataFrame:
+def run_phase1_matching(
+    tasks: pd.DataFrame,
+    df_cg: pd.DataFrame,
+    config: PipelineConfig,
+) -> pd.DataFrame:
     match_results = []
 
-    # 進入逐筆比對迴圈前，先以單次 OSRM /table 批次查詢暖身快取（居服員住家 x 任務地點），
-    # 取代 N x M 次個別 HTTP 請求。
-    prefetch_osrm_travel_times(
-        ((cg["服務起點_緯度(家)"], cg["服務起點_經度(家)"]) for _, cg in df_cg.iterrows()),
-        ((task["服務地點_緯度"], task["服務地點_經度"]) for _, task in tasks.iterrows()),
-        config.travel_min_per_km,
-    )
-
+    # 進入逐筆比對迴圈前，先以單次 OSRM /table 批次查詢暖身快取
+    # （居服員住家 x 任務地點），取代 N x M 次個別 HTTP 請求。
+    # 只有未啟用 Google Routes 時，才預抓 OSRM 矩陣
+    if not _get_google_maps_api_key():
+        prefetch_osrm_travel_times(
+            (
+                (cg["服務起點_緯度(家)"], cg["服務起點_經度(家)"])
+                for _, cg in df_cg.iterrows()
+            ),
+            (
+                (task["服務地點_緯度"], task["服務地點_經度"])
+                for _, task in tasks.iterrows()
+            ),
+            config.travel_min_per_km,
+        )
     for _, task in tasks.iterrows():
         t_id = task["任務ID"]
         c_id = task["案家ID"]
@@ -885,9 +918,9 @@ def run_phase1_matching(tasks: pd.DataFrame, df_cg: pd.DataFrame, config: Pipeli
         matched_count_for_task = 0
         reason_counts: dict = {}
 
-            for _, cg in df_cg.iterrows():
-                cg_id = cg["居服員ID"]
-                is_preferred = cg_id == pref_cg
+        for _, cg in df_cg.iterrows():
+            cg_id = cg["居服員ID"]
+            is_preferred = cg_id == pref_cg
 
             transport_mode = str(
                 cg.get("常用交通工具", "機車")
@@ -1485,9 +1518,19 @@ def run_phase2_optimization(
     busy_coords = [
         (b_lat, b_lon) for intervals in cg_busy.values() for (_, _, b_lat, b_lon) in intervals
     ]
-    if busy_coords:
-        prefetch_osrm_travel_times(task_coords, busy_coords, config.travel_min_per_km)
-    prefetch_osrm_travel_times(task_coords, task_coords, config.travel_min_per_km)
+    if not _get_google_maps_api_key():
+        if busy_coords:
+            prefetch_osrm_travel_times(
+                task_coords,
+                busy_coords,
+                config.travel_min_per_km,
+            )
+
+        prefetch_osrm_travel_times(
+            task_coords,
+            task_coords,
+            config.travel_min_per_km,
+        )
 
     # 過濾掉與既定行程衝突（含轉場緩衝時間）的配對
     valid_rows = []
